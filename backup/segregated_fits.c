@@ -38,6 +38,8 @@ team_t team = {
 #define DSIZE 16
 #define QSIZE 32
 #define CHUNKSIZE (1<<12)
+#define SEGREGATED_MAX_SIZE 15
+#define SEGREGATED_SIZE(idx) (0x10 << (idx))
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -62,83 +64,52 @@ team_t team = {
 #define ALIGN(size) (((size) + (WSIZE - 1)) & ~0x7)
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
-static char *heap_listp;
-// for next_fit
-static void *last_bp;
-
-static void insert_block_LIFO(void *bp)
+static size_t bucket_size[SEGREGATED_MAX_SIZE-1] = 
 {
-    NEXTP(bp) = heap_listp;
+    16,
+    32,
+    48,
+    64,
+    128,
+    192,
+    256,
+    384,
+    456,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+};
+
+static void *segregated_listp[SEGREGATED_MAX_SIZE];
+
+static void insert_block_LIFO(void *bp, int idx)
+{
+    NEXTP(bp) = segregated_listp[idx];
     PREVP(bp) = NULL;
-    if (heap_listp != NULL)
-        PREVP(heap_listp) = bp;
-    heap_listp = bp;
+    if (segregated_listp[idx] != NULL)
+        PREVP(segregated_listp[idx]) = bp;
+    segregated_listp[idx] = bp;
 }
 
-static void insert_block_adress(void *bp)
-{
-    if (heap_listp == NULL)
-    {
-        NEXTP(bp) = NULL;
-        PREVP(bp) = NULL;
-        heap_listp = bp;
-        return;
-    }
-
-    void *prebp = NULL;
-    void *curbp = heap_listp;
-    while (curbp != NULL && curbp < bp)
-    {
-        prebp = curbp;
-        curbp = NEXTP(curbp); 
-    }
-
-    NEXTP(bp) = curbp;
-    PREVP(bp) = prebp;
-    if (curbp != NULL)
-        PREVP(curbp) = bp;
-    if (prebp != NULL)
-        NEXTP(prebp) = bp;
-    else
-        heap_listp = bp;
-}
-
-static void insert_block_size(void *bp)
-{
-    if (heap_listp == NULL)
-    {
-        NEXTP(bp) = NULL;
-        PREVP(bp) = NULL;
-        heap_listp = bp;
-        return;
-    }
-
-    void *prebp = NULL;
-    void *curbp = heap_listp;
-    while (curbp != NULL && GET_SIZE(HDRP(curbp)) < GET_SIZE(HDRP(bp)))
-    {
-        prebp = curbp;
-        curbp = NEXTP(curbp); 
-    }
-
-    NEXTP(bp) = curbp;
-    PREVP(bp) = prebp;
-    if (curbp != NULL)
-        PREVP(curbp) = bp;
-    if (prebp != NULL)
-        NEXTP(prebp) = bp;
-    else
-        heap_listp = bp;
-}
-
-static void remove_block(void *bp)
+static void remove_block(void *bp, int idx)
 {
     if (PREVP(bp) == NULL)
-        heap_listp = NEXTP(bp);
+        segregated_listp[idx] = NEXTP(bp);
     else
         NEXTP(PREVP(bp)) = NEXTP(bp);
     if (NEXTP(bp) != NULL)
         PREVP(NEXTP(bp)) = PREVP(bp);
+}
+
+static int calc_idx(size_t asize)
+{
+    int idx = 0;
+    for (int i=0; i<SEGREGATED_MAX_SIZE-1; i++)
+        if (asize > bucket_size[i])
+            idx++;
+    return idx;
 }
 
 static void *coalesce(void *bp)
@@ -156,8 +127,9 @@ static void *coalesce(void *bp)
     // case 2
     else if (prev_alloc && !next_alloc)
     {
-        remove_block(NEXT_BLKP(bp));
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        remove_block(NEXT_BLKP(bp), calc_idx(next_size));
+        size += next_size;
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     }
@@ -165,8 +137,9 @@ static void *coalesce(void *bp)
     // case 3
     else if (!prev_alloc && next_alloc)
     {
-        remove_block(PREV_BLKP(bp));
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(bp)));
+        remove_block(PREV_BLKP(bp), calc_idx(prev_size));
+        size += prev_size;
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
         bp = PREV_BLKP(bp);
@@ -175,16 +148,17 @@ static void *coalesce(void *bp)
     // case 4
     else if (!prev_alloc && !next_alloc)
     {
-        remove_block(PREV_BLKP(bp));
-        remove_block(NEXT_BLKP(bp));
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(bp)));
+        size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        remove_block(PREV_BLKP(bp), calc_idx(prev_size));
+        remove_block(NEXT_BLKP(bp), calc_idx(next_size));
+        size += prev_size + next_size;
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
 
-    insert_block_size(bp);
-    last_bp = bp;
+    insert_block_LIFO(bp, calc_idx(size));
     return bp;
 }
 
@@ -209,6 +183,7 @@ static void *extend_heap(size_t words)
  */
 int mm_init(void)
 {
+    char *heap_listp;
     if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1)
         return -1;
 
@@ -216,65 +191,47 @@ int mm_init(void)
     PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));
     PUT(heap_listp + (3*WSIZE), PACK(0, 1));
-    heap_listp = NULL;
 
-    if ((extend_heap(CHUNKSIZE/WSIZE)) == NULL)
-        return -1;
-    // for next_fit
-    last_bp = heap_listp;
+    for (int i=0; i<SEGREGATED_MAX_SIZE; i++)
+        segregated_listp[i] = NULL;
 
     return 0;
 }
 
-static void *first_fit(size_t asize)
+static void *first_fit(size_t asize, int idx)
 {
-    // 힙리스트 순회
-    void *bp = heap_listp;
-    while (bp != NULL)
+    // 힙리스트 idx부터 순회
+    for (int i=idx; i<SEGREGATED_MAX_SIZE; i++)
     {
-        // 할당 안되었고 크기도 요구하는거보다 작거나 같으면 해당 블럭포인터 return
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
-            return bp;
-        bp = NEXTP(bp);
+        void *bp = segregated_listp[i];
+        while (bp != NULL)
+        {
+            // 할당 안되었고 크기도 요구하는거보다 작거나 같으면 해당 블럭포인터 return
+            if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
+                return bp;
+            bp = NEXTP(bp);
+        }
     }
+
     // 맞는게 없음
     return NULL;
 }
 
-static void *next_fit(size_t asize)
+static void *best_fit(size_t asize, int idx)
 {
-    // last_bp 부터 힙리스트 순회
-    void *bp = last_bp;
-    while (bp != NULL)
-    {
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
-            return bp;
-        bp = NEXTP(bp);
-    }
-    // 못찾으면 처음부터 last_bp까지 다시 순회
-    bp = heap_listp;
-    while (bp != last_bp)
-    {
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
-            return bp;
-        bp = NEXTP(bp);
-    }
-    // 또 못찾으면 맞는게 없음
-    return NULL;
-}
-
-static void *best_fit(size_t asize)
-{
-    void *bp = heap_listp;
     void *best_bp = NULL;
-    while (bp != NULL)
+    for (int i=idx; i<SEGREGATED_MAX_SIZE; i++)
     {
-        // 할당 안되었고 크기도 요구하는거보다 작거나 같으면
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
-            // best_bp가 NULL 이거나 best_bp 보다 작으면
-            if (best_bp == NULL || GET_SIZE(HDRP(bp)) < GET_SIZE(HDRP(best_bp)))
-                best_bp = bp;
-        bp = NEXTP(bp);
+        void *bp = segregated_listp[i];
+        while (bp != NULL)
+        {
+            // 할당 안되었고 크기도 요구하는거보다 작거나 같으면
+            if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
+                // best_bp가 NULL 이거나 best_bp 보다 작으면
+                if (best_bp == NULL || GET_SIZE(HDRP(bp)) < GET_SIZE(HDRP(best_bp)))
+                    best_bp = bp;
+            bp = NEXTP(bp);
+        }
     }
     return best_bp;
 }
@@ -282,7 +239,7 @@ static void *best_fit(size_t asize)
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp));
-    remove_block(bp);
+    remove_block(bp, calc_idx(csize));
 
     // 너무 크면 쪼개기
     if ((csize - asize) >= (QSIZE))
@@ -299,7 +256,6 @@ static void place(void *bp, size_t asize)
     {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
-        last_bp = NEXTP(bp);
     }
 }
 
@@ -318,7 +274,7 @@ void *mm_malloc(size_t size)
 
     asize = (size <= DSIZE) ? QSIZE : ALIGN(size + DSIZE);
 
-    if ((bp = next_fit(asize)) != NULL)
+    if ((bp = best_fit(asize, calc_idx(asize))) != NULL)
     {
         place(bp, asize);
         return bp;
@@ -340,7 +296,6 @@ void *mm_malloc(size_t size)
 void mm_free(void *bp)
 {
     size_t size = GET_SIZE(HDRP(bp));
-
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
     coalesce(bp);
@@ -415,11 +370,11 @@ void *mm_realloc(void *bp, size_t size)
         // case 2
         else if (prev_alloc && !next_alloc)
         {
-            size_t total_size = cursize + GET_SIZE(HDRP(NEXT_BLKP(bp)));
+            size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(bp)));
+            size_t total_size = cursize + next_size;
             if (total_size >= asize)
             {
-                last_bp = NEXTP(NEXT_BLKP(bp));
-                remove_block(NEXT_BLKP(bp));
+                remove_block(NEXT_BLKP(bp), calc_idx(next_size));
                 PUT(HDRP(bp), PACK(total_size, 1));
                 PUT(FTRP(bp), PACK(total_size, 1));
 
@@ -440,11 +395,11 @@ void *mm_realloc(void *bp, size_t size)
         // case 3
         else if (!prev_alloc && next_alloc)
         {
-            size_t total_size = cursize + GET_SIZE(HDRP(PREV_BLKP(bp)));
+            size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(bp)));
+            size_t total_size = cursize + prev_size;
             if (total_size >= asize)
             {
-                last_bp = NEXTP(PREV_BLKP(bp));
-                remove_block(PREV_BLKP(bp));
+                remove_block(PREV_BLKP(bp), calc_idx(prev_size));
                 PUT(HDRP(PREV_BLKP(bp)), PACK(total_size, 1));
                 PUT(FTRP(bp), PACK(total_size, 1));
                 bp = PREV_BLKP(bp);
@@ -467,12 +422,13 @@ void *mm_realloc(void *bp, size_t size)
         // case 4
         else if (!prev_alloc && !next_alloc)
         {
-            size_t total_size = cursize + GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
+            size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(bp)));
+            size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(bp)));
+            size_t total_size = cursize + prev_size + next_size;
             if (total_size >= asize)
             {
-                remove_block(PREV_BLKP(bp));
-                last_bp = NEXTP(NEXT_BLKP(bp));
-                remove_block(NEXT_BLKP(bp));
+                remove_block(PREV_BLKP(bp), calc_idx(prev_size));
+                remove_block(NEXT_BLKP(bp), calc_idx(next_size));
                 PUT(HDRP(PREV_BLKP(bp)), PACK(total_size, 1));
                 PUT(FTRP(NEXT_BLKP(bp)), PACK(total_size, 1));
                 bp = PREV_BLKP(bp);
@@ -490,6 +446,19 @@ void *mm_realloc(void *bp, size_t size)
                 }
                 return bp;
             }
+        }
+
+        // 힙의 끝영역이면
+        if (GET_SIZE(HDRP(NEXT_BLKP(bp))) == 0)
+        {
+            // 필요한 추가 크기 계산 및 확장
+            size_t extendsize = asize - cursize;
+            if ((long)(mem_sbrk(extendsize)) == -1)
+                return NULL;
+            PUT(HDRP(bp), PACK(asize, 1));
+            PUT(FTRP(bp), PACK(asize, 1));
+            PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
+            return bp;
         }
 
         // 확장 실패 추가 할당
